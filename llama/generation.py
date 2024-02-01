@@ -7,6 +7,8 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple, TypedDict
+import contextlib
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +17,7 @@ from fairscale.nn.model_parallel.initialize import (
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from llama.model import ModelArgs, Transformer
 from llama.tokenizer import Tokenizer
@@ -135,6 +138,7 @@ class Llama:
         top_p: float = 0.9,
         logprobs: bool = False,
         echo: bool = False,
+        profile_flag: bool = True
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
         Generate text sequences based on provided prompts using the language generation model.
@@ -183,33 +187,47 @@ class Llama:
                 ignore_index=pad_id,
             )
 
-        for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
-            if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
+        def trace_option(activities, record_shapes, profile_memory, save_trace, schedule):
+            if save_trace:
+                return profile(activities=activities, record_shapes=record_shapes, profile_memory=profile_memory)
             else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)
+                return contextlib.nullcontext()
+        with trace_option(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=False, save_trace=profile_flag, schedule=torch.profiler.schedule(wait=1, warmup=1, active=7)) as prof:
+            for cur_pos in range(min_prompt_len, total_len):
+                with record_function("forward_step"):
+                    logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+                    
+                    if prof is not None:
+                        prof.step()
 
-            next_token = next_token.reshape(-1)
-            # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
-            tokens[:, cur_pos] = next_token
-            if logprobs:
-                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
-                    input=logits.transpose(1, 2),
-                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
-                    reduction="none",
-                    ignore_index=pad_id,
-                )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                next_token == self.tokenizer.eos_id
-            )
-            prev_pos = cur_pos
-            if all(eos_reached):
-                break
+                    if temperature > 0:
+                        probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                        next_token = sample_top_p(probs, top_p)
+                    else:
+                        next_token = torch.argmax(logits[:, -1], dim=-1)
+
+                    next_token = next_token.reshape(-1)
+                    # only replace token if prompt has already been generated
+                    next_token = torch.where(
+                        input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+                    )
+                    tokens[:, cur_pos] = next_token
+                    if logprobs:
+                        token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
+                            input=logits.transpose(1, 2),
+                            target=tokens[:, prev_pos + 1 : cur_pos + 1],
+                            reduction="none",
+                            ignore_index=pad_id,
+                        )
+                    eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                        next_token == self.tokenizer.eos_id
+                    )
+                    prev_pos = cur_pos
+                    if all(eos_reached):
+                        break
+
+        if prof is not None:
+            prof.export_chrome_trace("./trace.json")
 
         if logprobs:
             token_logprobs = token_logprobs.tolist()
@@ -289,6 +307,7 @@ class Llama:
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
     ) -> List[ChatPrediction]:
+
         """
         Generate assistant responses for a list of conversational dialogs using the language generation model.
 
@@ -393,6 +412,56 @@ class Llama:
             }
             for t, unsafe in zip(generation_tokens, unsafe_requests)
         ]
+
+    def fixed_text_completion(
+        self,
+        batch_size: int = 1,
+        prompt_token_num: int = 1024,
+        temperature: float = 0.0,
+        top_p: float = 0.9,
+        max_gen_len: Optional[int] = None,
+        logprobs: bool = False,
+        echo: bool = False,
+        profile_flag: bool = True,
+    ) -> List[CompletionPrediction]:
+        if max_gen_len is None:
+            max_gen_len = self.model.params.max_seq_len - 1
+
+        prompt_tokens = np.random.randint(3,4096,(batch_size, prompt_token_num)).tolist()
+
+        # warp up
+        generation_tokens, generation_logprobs = self.generate(
+            prompt_tokens=prompt_tokens,
+            max_gen_len=max_gen_len,
+            temperature=temperature,
+            top_p=top_p,
+            logprobs=logprobs, 
+            echo=echo,
+            profile_flag=False,
+        )
+
+        if profile_flag:
+            generation_tokens, generation_logprobs = self.generate(
+                prompt_tokens=prompt_tokens,
+                max_gen_len=max_gen_len,
+                temperature=temperature,
+                top_p=top_p,
+                logprobs=logprobs, 
+                echo=echo,
+                profile_flag=profile_flag,
+            )
+
+
+        if logprobs:
+            return [
+                {
+                    "generation": self.tokenizer.decode(t),
+                    "tokens": [self.tokenizer.decode(x) for x in t],
+                    "logprobs": logprobs_i,
+                }
+                for t, logprobs_i in zip(generation_tokens, generation_logprobs)
+            ]
+        return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
 
 
 def sample_top_p(probs, p):

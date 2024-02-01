@@ -48,3 +48,5 @@ Please report any violation of this Policy, software “bug,” or other problem
 * Reporting bugs and security concerns: [facebook.com/whitehat/info](http://facebook.com/whitehat/info)
 * Reporting violations of the Acceptable Use Policy or unlicensed uses of Llama: [LlamaUseReport@meta.com](mailto:LlamaUseReport@meta.com)
 
+amaUseReport@meta.com)
+
